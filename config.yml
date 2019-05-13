@@ -1,0 +1,4 @@
+exam_name: "Exam Name"
+exam_section: "Exam Section"
+total_questions: 100
+total_time: 100  # in minutes
