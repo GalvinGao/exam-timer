@@ -1,24 +1,37 @@
 package main
 
 import (
+	"encoding/json"
 	"errors"
+	"log"
+	"net/url"
+	"os"
+	"path"
 )
 
 type Session struct {
-	Started bool
-	Timers  []Question
-	Current uint
+	Started  bool
+	Timers   []Question
+	Current  uint
+	fileName string
 }
 
-func NewSession(count uint) *Session {
+func NewSession(count uint, fileName string) *Session {
 	var questions []Question
 	for i := uint(0); i < count; i++ {
 		questions = append(questions, NewQuestion(i))
 	}
 
+	recordsFile, err := url.Parse("records")
+	if err != nil {
+		log.Fatal(err)
+	}
+	recordsFile.Path = path.Join(recordsFile.Path, fileName+".json")
+
 	return &Session{
-		Current: 0,
-		Timers:  questions,
+		Current:  0,
+		Timers:   questions,
+		fileName: recordsFile.String(),
 	}
 }
 
@@ -59,11 +72,26 @@ func (s *Session) Next() error {
 }
 
 func (s *Session) End() error {
-	err := s.CurrentTimer().Stop()
+	_ = s.CurrentTimer().Stop()
+	file, err := os.Create(s.fileName)
 	if err != nil {
 		return err
 	}
-	return nil
+	set := map[uint]int64{}
+	for i := range s.Timers {
+		timer := s.Timers[i]
+		set[timer.Index] = -timer.Duration.Nanoseconds()
+	}
+	jsonBytes, err := json.Marshal(set)
+	if err != nil {
+		return err
+	}
+	_, err = file.Write(jsonBytes)
+	if err != nil {
+		return err
+	}
+	err = file.Close()
+	return err
 }
 
 func (s *Session) SwitchPause() error {

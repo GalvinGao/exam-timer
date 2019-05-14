@@ -1,17 +1,24 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	ui "github.com/gizak/termui/v3"
 	"github.com/gizak/termui/v3/widgets"
 	"gopkg.in/yaml.v2"
 	"io/ioutil"
 	"log"
+	"net/url"
+	"os"
+	"path"
+	"strings"
 	"time"
 )
 
 const (
-	HISTORY_DURATION = 7
+	HISTORY_DURATION   = 7
+	LOG_FILE_PREFIX    = "logs"
+	RECORD_FILE_PREFIX = "records"
 )
 
 type Config struct {
@@ -32,6 +39,37 @@ func main() {
 		log.Fatalf("Unmarshal: %v", err)
 	}
 
+	for _, prefix := range []string{LOG_FILE_PREFIX, RECORD_FILE_PREFIX} {
+		err := os.MkdirAll(prefix, os.ModePerm)
+		if err != nil {
+			panic(err)
+		}
+	}
+
+	// Sanitize File Name
+	examName := sanitize(strings.ToLower(config.ExamName))
+	examSection := sanitize(strings.ToLower(config.ExamSection))
+	currentTime := time.Now().Format("20060102150405")
+	sanitizedFileName := fmt.Sprintf("%s_%s_section-%s", currentTime, examName, examSection)
+
+	// Log
+	logFile, err := url.Parse(LOG_FILE_PREFIX)
+	if err != nil {
+		log.Fatal(err)
+	}
+	logFile.Path = path.Join(logFile.Path, sanitizedFileName+".log")
+	f, err := os.OpenFile(logFile.String(), os.O_RDWR|os.O_CREATE|os.O_APPEND, 0666)
+	if err != nil {
+		log.Fatalf("error opening file: %v", err)
+	}
+	defer func() {
+		err := f.Close()
+		if err != nil {
+			panic(err)
+		}
+	}()
+	log.SetOutput(f)
+
 	// initialize termui
 	err = ui.Init()
 	if err != nil {
@@ -39,7 +77,20 @@ func main() {
 	}
 	defer ui.Close()
 
-	session := NewSession(config.TotalQuestions)
+	host, err := os.Hostname()
+	if err != nil {
+		host = "unknown"
+	}
+	log.Print("logger initialized.")
+	log.Printf("host: %s", host)
+	log.Printf("time: %s", time.Now().String())
+	sessionMarshaled, err := json.Marshal(config)
+	if err != nil {
+		sessionMarshaled = []byte{}
+	}
+	log.Printf("sessionConfig: %s", sessionMarshaled)
+
+	session := NewSession(config.TotalQuestions, sanitizedFileName)
 
 	logo := widgets.NewParagraph()
 	logo.Title = "Session Summary"
@@ -60,13 +111,20 @@ func main() {
 	progress.Label = fmt.Sprintf("Q%s/%s (%s%%)", "--", "--", "--")
 	progress.LabelStyle.Fg = ui.ColorMagenta
 
+	status := widgets.NewParagraph()
+	status.Title = "Status"
+	//status.Border = false
+	status.PaddingLeft = 19
+	status.TextStyle.Fg = ui.ColorGreen
+	status.Text = "STOPPED"
+
 	current := widgets.NewParagraph()
 	current.Title = "Current"
 	//current.Border = false
 	current.PaddingLeft = 15
 	current.PaddingTop, current.PaddingBottom = 3, 3
 	current.TextStyle.Fg = ui.ColorGreen
-	current.Text = "Q-- - --:--\nPress \"s\" to start"
+	current.Text = "Q-- | --:--"
 
 	history := widgets.NewBarChart()
 	history.Title = "History"
@@ -84,9 +142,9 @@ func main() {
 
 	help := widgets.NewParagraph()
 	//help.Border = false
-	help.Title = "Keybinds"
+	help.Title = "Help"
 	help.PaddingTop = 1
-	help.Text = "[q] Quit   (space) Next Question   [e] End Session   [p] Pause/resume"
+	help.Text = "[q] Quit   [s] Start Session   (space) Next Question   [e] End Session   [p] Pause/resume"
 	help.TextStyle.Fg = ui.ColorYellow
 
 	grid := ui.NewGrid()
@@ -104,6 +162,8 @@ func main() {
 
 			progress.Percent = int(percent)
 			progress.Label = fmt.Sprintf("Q%02d/%02d (%02d%%)", elapsed, config.TotalQuestions, percent)
+
+			status.Text = "RUNNING"
 
 			var labels []string
 			var dataset []float64
@@ -124,19 +184,22 @@ func main() {
 				if timer.Running() {
 					seconds += timer.LastStart.Sub(time.Now())
 				}
-				seconds_value := -int(seconds.Seconds())
+				secondsValue := -int(seconds.Seconds())
 				//fmt.Print(seconds)
-				if seconds_value == 0 {
+				if secondsValue == 0 {
 					continue
 				}
 				labels = append(labels, fmt.Sprintf("Q%d", i+1))
-				dataset = append(dataset, float64(seconds_value))
+				dataset = append(dataset, float64(secondsValue))
 			}
 			history.Labels = labels
 			history.Data = dataset
 			//history.Text = fmt.Sprintf("%v, %v", labels, dataset)
-			current.Text = fmt.Sprintf("Q%02d - %02d:%02d", currentTimer.Index, int(currentTimerElapsed.Minutes()), int(currentTimerElapsed.Seconds()))
-			ui.Render(progress, history, current)
+			current.Text = fmt.Sprintf("Q%02d | %02d:%02d", currentTimer.Index, int(currentTimerElapsed.Minutes()), int(currentTimerElapsed.Seconds()))
+			ui.Render(progress, history, current, status)
+		} else {
+			status.Text = "STOPPED"
+			ui.Render(status)
 		}
 	}
 
@@ -147,14 +210,19 @@ func main() {
 		),
 		ui.NewRow(1.0/6, progress),
 		ui.NewRow(2.0/6,
-			ui.NewCol(1.0/2, current),
+			ui.NewCol(1.0/2,
+				ui.NewRow(1.0/2, status),
+				ui.NewRow(1.0/2, current),
+			),
 			ui.NewCol(1.0/2, history),
 		),
 		ui.NewRow(1.0/6, quote),
 		ui.NewRow(1.0/6, help),
 	)
 
+	log.Println("initializing ui...")
 	ui.Render(grid)
+	log.Println("ui initialized.")
 
 	uiEvents := ui.PollEvents()
 	ticker := time.NewTicker(1 * time.Second).C
@@ -162,8 +230,10 @@ func main() {
 	for {
 		select {
 		case e := <-uiEvents:
+			log.Printf("key %s pressed", e.ID)
 			switch e.ID {
 			case "q", "<C-c>":
+				log.Println("quitting...")
 				return
 			case "<Resize>":
 				payload := e.Payload.(ui.Resize)
@@ -171,24 +241,31 @@ func main() {
 				ui.Clear()
 				ui.Render(grid)
 			case "s":
+				log.Println("starting session...")
 				err := session.Start()
 				refresh()
 				if err != nil {
 					panic(err)
 				}
 			case "<Space>":
+				log.Println("switching to next question in session")
 				err := session.Next()
 				refresh()
 				if err != nil {
 					panic(err)
 				}
 			case "e":
+				log.Println("ending session")
 				err := session.End()
 				refresh()
 				if err != nil {
 					panic(err)
+				} else {
+					log.Println("session ended.")
+					return
 				}
 			case "p":
+				log.Println("pausing/resuming session")
 				err := session.SwitchPause()
 				refresh()
 				if err != nil {
